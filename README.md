@@ -12,7 +12,7 @@ Check the examples and presentation video in the [Demo Page](https://liuxubo717.
 Clone the repository and setup the conda environment: 
 
   ```
-  git clone https://github.com/liuxubo717/LASS.git && \
+  https://github.com/AnhTuan2003ml/Lass.git && \
   cd LASS && \ 
   conda env create -f environment.yml && \
   conda activate LASS 
