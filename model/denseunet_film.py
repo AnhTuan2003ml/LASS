@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchlibrosa.stft import STFT, ISTFT, magphase
-from models.base import Base, init_layer, init_bn
+from models import Base, init_layer, init_bn
 import numpy as np
 
 
