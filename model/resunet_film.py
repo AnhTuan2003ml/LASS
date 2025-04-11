@@ -1,110 +1,83 @@
-from .modules import *
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+from model.denseunet import DenseUNet30  # thay UNetRes_FiLM bằng DenseUNet30
+from torchlibrosa.stft import STFT, ISTFT, magphase
 
-class UNetRes_FiLM(nn.Module):
-    def __init__(self, channels, cond_embedding_dim, nsrc=1):
-        super(UNetRes_FiLM, self).__init__()
-        activation = 'relu'
-        momentum = 0.01
+class DenseUNet_Interface(nn.Module):
+    def __init__(self, checkpoint_path=None, device='cuda'):
+        super().__init__()
 
-        self.nsrc = nsrc
-        self.channels = channels
-        self.downsample_ratio = 2 ** 6  # This number equals 2^{#encoder_blocks}
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.model = DenseUNet30(target_sources_num=1, target_sources=['target'], output_channels=1).to(self.device)
 
-        self.encoder_block1 = EncoderBlockRes2BCond(in_channels=channels * nsrc, out_channels=32,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.encoder_block2 = EncoderBlockRes2BCond(in_channels=32, out_channels=64,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.encoder_block3 = EncoderBlockRes2BCond(in_channels=64, out_channels=128,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.encoder_block4 = EncoderBlockRes2BCond(in_channels=128, out_channels=256,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.encoder_block5 = EncoderBlockRes2BCond(in_channels=256, out_channels=384,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.encoder_block6 = EncoderBlockRes2BCond(in_channels=384, out_channels=384,
-                                                    downsample=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.conv_block7 = ConvBlockResCond(in_channels=384, out_channels=384,
-                                            kernel_size=(3, 3), activation=activation, momentum=momentum,
-                                            cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block1 = DecoderBlockRes2BCond(in_channels=384, out_channels=384,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block2 = DecoderBlockRes2BCond(in_channels=384, out_channels=384,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block3 = DecoderBlockRes2BCond(in_channels=384, out_channels=256,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block4 = DecoderBlockRes2BCond(in_channels=256, out_channels=128,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block5 = DecoderBlockRes2BCond(in_channels=128, out_channels=64,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
-        self.decoder_block6 = DecoderBlockRes2BCond(in_channels=64, out_channels=32,
-                                                    stride=(2, 2), activation=activation, momentum=momentum,
-                                                    cond_embedding_dim=cond_embedding_dim)
+        if checkpoint_path:
+            ckpt = torch.load(checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(ckpt['state_dict'] if 'state_dict' in ckpt else ckpt)
 
-        self.after_conv_block1 = ConvBlockResCond(in_channels=32, out_channels=32,
-                                                  kernel_size=(3, 3), activation=activation, momentum=momentum,
-                                                  cond_embedding_dim=cond_embedding_dim)
+        self.model.eval()
 
-        self.after_conv2 = nn.Conv2d(in_channels=32, out_channels=1,
-                                     kernel_size=(1, 1), stride=(1, 1), padding=(0, 0), bias=True)
+        self.stft = STFT(n_fft=1024, hop_length=256, win_length=1024).to(self.device)
+        self.istft = ISTFT(n_fft=1024, hop_length=256, win_length=1024).to(self.device)
 
-        self.init_weights()
+    def forward(self, input_dict):
+        waveform = input_dict['mixture'].to(self.device)
+        condition = input_dict['condition'].to(self.device)
 
-    def init_weights(self):
-        init_layer(self.after_conv2)
+        if waveform.ndim == 2:
+            waveform = waveform.unsqueeze(1)  # (B, 1, T)
 
-    def forward(self, sp, cond_vec, dec_cond_vec):
-        """
-        Args:
-          input: sp: (batch_size, channels_num, segment_samples)
-        Outputs:
-          output_dict: {
-            'wav': (batch_size, channels_num, segment_samples),
-            'sp': (batch_size, channels_num, time_steps, freq_bins)}
-        """
+        mag, cos, sin = self.wav_to_spectrogram_phase(waveform.squeeze(1))  # (B, T, F)
+        x = mag.unsqueeze(1)  # (B, 1, T, F)
 
-        x = sp
-        # Pad spectrogram to be evenly divided by downsample ratio.
-        origin_len = x.shape[2]  # time_steps
-        pad_len = int(np.ceil(x.shape[2] / self.downsample_ratio)) * self.downsample_ratio - origin_len
-        x = F.pad(x, pad=(0, 0, 0, pad_len))
-        x = x[..., 0: x.shape[-1] - 2]  # (bs, channels, T, F)
+        with torch.no_grad():
+            out = self.model(x, condition, condition)  # (B, 3, T, F)
+            out = out[:, :, :mag.shape[1], :]
+            waveform_out = self.feature_maps_to_wav(out, mag, sin, cos, waveform.shape[2])
 
-        # UNet
-        (x1_pool, x1) = self.encoder_block1(x, cond_vec)  # x1_pool: (bs, 32, T / 2, F / 2)
-        (x2_pool, x2) = self.encoder_block2(x1_pool, cond_vec)  # x2_pool: (bs, 64, T / 4, F / 4)
-        (x3_pool, x3) = self.encoder_block3(x2_pool, cond_vec)  # x3_pool: (bs, 128, T / 8, F / 8)
-        (x4_pool, x4) = self.encoder_block4(x3_pool, dec_cond_vec)  # x4_pool: (bs, 256, T / 16, F / 16)
-        (x5_pool, x5) = self.encoder_block5(x4_pool, dec_cond_vec)  # x5_pool: (bs, 512, T / 32, F / 32)
-        (x6_pool, x6) = self.encoder_block6(x5_pool, dec_cond_vec)  # x6_pool: (bs, 1024, T / 64, F / 64)
-        x_center = self.conv_block7(x6_pool, dec_cond_vec)  # (bs, 2048, T / 64, F / 64)
-        x7 = self.decoder_block1(x_center, x6, dec_cond_vec)  # (bs, 1024, T / 32, F / 32)
-        x8 = self.decoder_block2(x7, x5, dec_cond_vec)  # (bs, 512, T / 16, F / 16)
-        x9 = self.decoder_block3(x8, x4, cond_vec)  # (bs, 256, T / 8, F / 8)
-        x10 = self.decoder_block4(x9, x3, cond_vec)  # (bs, 128, T / 4, F / 4)
-        x11 = self.decoder_block5(x10, x2, cond_vec)  # (bs, 64, T / 2, F / 2)
-        x12 = self.decoder_block6(x11, x1, cond_vec)  # (bs, 32, T, F)
-        x = self.after_conv_block1(x12, cond_vec)  # (bs, 32, T, F)
-        x = self.after_conv2(x)  # (bs, channels, T, F)
+        return {'waveform': waveform_out}
 
-        # Recover shape
-        x = F.pad(x, pad=(0, 2))
-        x = x[:, :, 0: origin_len, :]
-        return x
+    def wav_to_spectrogram_phase(self, input):
+        real, imag = self.stft(input)
+        mag = (real ** 2 + imag ** 2) ** 0.5
+        cos = real / (mag + 1e-8)
+        sin = imag / (mag + 1e-8)
+        return mag, cos, sin
+
+    def feature_maps_to_wav(self, x, mag, sin_in, cos_in, audio_length):
+        B, _, T, F = x.shape
+        x = x.reshape(B, 1, 3, T, F)
+        mask_mag = torch.sigmoid(x[:, :, 0])
+        mask_real = torch.tanh(x[:, :, 1])
+        mask_imag = torch.tanh(x[:, :, 2])
+
+        _, mask_cos, mask_sin = magphase(mask_real, mask_imag)
+
+        mag = mag[:, None, :T, :F]
+        cos_in = cos_in[:, None, :T, :F]
+        sin_in = sin_in[:, None, :T, :F]
+
+        out_cos = cos_in * mask_cos - sin_in * mask_sin
+        out_sin = sin_in * mask_cos + cos_in * mask_sin
+        out_mag = F.relu_(mag * mask_mag)
+
+        out_real = out_mag * out_cos
+        out_imag = out_mag * out_sin
+
+        out_real = out_real.reshape(B, 1, T, F)
+        out_imag = out_imag.reshape(B, 1, T, F)
+
+        waveform = self.istft(out_real, out_imag, audio_length)
+        waveform = waveform.reshape(B, 1, audio_length)
+        return waveform
 
 
 if __name__ == "__main__":
-    model = UNetRes_FiLM(channels=1, cond_embedding_dim=16)
-    cond_vec = torch.randn((1, 16))
-    dec_vec = cond_vec
-    print(model(torch.randn((1, 1, 1001, 513)), cond_vec, dec_vec).size())
+    model = DenseUNet_Interface(checkpoint_path=None)
+    dummy_input = {
+        'mixture': torch.randn(1, 160000),
+        'condition': torch.randn(1, 512)
+    }
+    output = model(dummy_input)
+    print(output['waveform'].shape)
