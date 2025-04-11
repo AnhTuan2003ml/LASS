@@ -1,26 +1,32 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model.text_encoder import Text_Encoder
-from model.denseunet import DenseUNet30
+from .text_encoder import Text_Encoder
+from .denseunet_film import DenseUNet30  # Import DenseUNet30 class from your previous code
 
 class LASSNet(nn.Module):
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', condition_size=256, input_channels=1, output_channels=1):
         super(LASSNet, self).__init__()
-        self.device = device
+        # Text embedding
         self.text_embedder = Text_Encoder(device)
-        self.UNet = DenseUNet30(target_sources_num=1, target_sources=['target'], output_channels=1)
+        
+        # DenseUNet30 model
+        self.UNet = DenseUNet30(input_channels=input_channels, 
+                                output_channels=output_channels, 
+                                condition_size=condition_size)
 
     def forward(self, x, caption):
-        # x: (Batch, 1, T, F)
+        # x: (Batch, 1, T, 128) - Input mixture
         input_ids, attns_mask = self.text_embedder.tokenize(caption)
-        cond_vec = self.text_embedder(input_ids, attns_mask)[0]  # (B, D)
+        
+        # Get the conditioning vector from the text encoder
+        cond_vec = self.text_embedder(input_ids, attns_mask)[0]
         dec_cond_vec = cond_vec
 
-        out = self.UNet(x, cond_vec, dec_cond_vec)  # (B, 3, T, F)
-        out = out[:, :, :x.shape[2], :x.shape[3]]
-
-        return out  # (B, 3, T, F)
+        # Generate mask using DenseUNet30
+        mask = self.UNet({'mixture': x, 'condition': dec_cond_vec})
+        mask = torch.sigmoid(mask['waveform'])
+        return mask
 
     def get_tokenizer(self):
         return self.text_embedder.tokenizer
